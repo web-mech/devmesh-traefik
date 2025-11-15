@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TEMPLATE_DIR="${REPO_ROOT}/traefik"
+STATE_DIR="${DEV_MESH_HOME:-${HOME}/.devmesh-traefik}" # live config location
+PROJECT_NAME="devmesh-traefik"
+NETWORK_NAME="${DEV_MESH_NETWORK:-devmesh-traefik}"
+DASHBOARD_PORT_RANGE="${DEV_MESH_DASHBOARD_RANGE:-7680-7799}"
+DASHBOARD_PORT_FILE="${STATE_DIR}/.dashboard-port"
+DASHBOARD_PORT=""
+DASHBOARD_PORT_SOURCE=""
+
+log() {
+  printf '[devmesh-traefik] %s\n' "$*"
+}
+
+usage() {
+  cat <<USAGE
+Usage: devmesh-traefik <command>
+
+Commands:
+  install        Copy the traefik template to \
+"${STATE_DIR}" and create the docker network
+  up             Start or reload the global traefik stack
+  down           Stop the global traefik stack
+  restart        Convenience alias for down + up
+  status         Show container status
+  logs           Tail traefik logs (Ctrl+C to stop)
+  reload         Send a configuration reload signal
+  inspect        Print paths/network details for troubleshooting
+  network        Ensure the shared network exists and print its name
+  help           Show this message
+USAGE
+}
+
+die() {
+  log "error: $*" >&2
+  exit 1
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' command is required"
+}
+
+ensure_installed() {
+  [[ -f "${STATE_DIR}/docker-compose.yml" ]] || die "state not found in ${STATE_DIR}. Run: devmesh-traefik install"
+}
+
+ensure_network() {
+  if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
+    log "creating docker network ${NETWORK_NAME}"
+    docker network create "${NETWORK_NAME}" >/dev/null
+  fi
+}
+
+range_bounds() {
+  local range="$1"
+  if [[ "${range}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  elif [[ "${range}" =~ ^[0-9]+$ ]]; then
+    printf '%s %s\n' "${range}" "${range}"
+  else
+    die "invalid DEV_MESH_DASHBOARD_RANGE: ${range}"
+  fi
+}
+
+allocate_dashboard_port() {
+  need_command python3
+  local bounds start end selection
+  bounds="$(range_bounds "${DASHBOARD_PORT_RANGE}")"
+  read -r start end <<<"${bounds}"
+  selection="$(python3 - "$start" "$end" <<'PY' || true
+import socket
+import sys
+
+start = int(sys.argv[1])
+end = int(sys.argv[2])
+
+for port in range(start, end + 1):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('127.0.0.1', port))
+        except OSError:
+            continue
+        print(port)
+        sys.exit(0)
+sys.exit(1)
+PY
+)"
+  [[ -n "${selection}" ]] || die "unable to find free port in range ${start}-${end}"
+  printf '%s' "${selection}"
+}
+
+ensure_dashboard_port() {
+  [[ -n "${DASHBOARD_PORT}" ]] && {
+    export DMT_DASHBOARD_PORT="${DASHBOARD_PORT}"
+    return
+  }
+
+  local candidate=""
+
+  if [[ -n "${DEV_MESH_DASHBOARD_PORT:-}" ]]; then
+    candidate="${DEV_MESH_DASHBOARD_PORT}"
+    DASHBOARD_PORT_SOURCE="env"
+  elif [[ -s "${DASHBOARD_PORT_FILE}" ]]; then
+    candidate="$(tr -d '[:space:]' <"${DASHBOARD_PORT_FILE}")"
+    DASHBOARD_PORT_SOURCE="state"
+  else
+    candidate="$(allocate_dashboard_port)"
+    printf '%s\n' "${candidate}" >"${DASHBOARD_PORT_FILE}"
+    DASHBOARD_PORT_SOURCE="auto"
+    log "selected dashboard port ${candidate} (range ${DASHBOARD_PORT_RANGE})"
+  }
+
+  [[ "${candidate}" =~ ^[0-9]+$ ]] || die "invalid dashboard port '${candidate}'"
+  DASHBOARD_PORT="${candidate}"
+  export DMT_DASHBOARD_PORT="${DASHBOARD_PORT}"
+}
+
+current_dashboard_port() {
+  if [[ -n "${DASHBOARD_PORT}" ]]; then
+    printf '%s' "${DASHBOARD_PORT}"
+  elif [[ -s "${DASHBOARD_PORT_FILE}" ]]; then
+    tr -d '[:space:]' <"${DASHBOARD_PORT_FILE}"
+  fi
+}
+
+run_compose() {
+  ensure_installed
+  ensure_dashboard_port
+  need_command docker
+  (
+    cd "${STATE_DIR}"
+    DMT_DASHBOARD_PORT="${DASHBOARD_PORT}" docker compose -p "${PROJECT_NAME}" "$@"
+  )
+}
+
+cmd_install() {
+  need_command docker
+  mkdir -p "${STATE_DIR}"
+  log "syncing template to ${STATE_DIR}"
+  (cd "${TEMPLATE_DIR}" && tar -cf - .) | (cd "${STATE_DIR}" && tar -xf -)
+  chmod 600 "${STATE_DIR}/letsencrypt/acme.json" 2>/dev/null || true
+  ensure_network
+  log "installation complete. run 'devmesh-traefik up' to start"
+}
+
+cmd_up() {
+  ensure_installed
+  ensure_network
+  run_compose up -d
+  log "dashboard available on http://localhost:${DASHBOARD_PORT}"
+}
+
+cmd_down() {
+  ensure_installed
+  run_compose down
+}
+
+cmd_status() {
+  ensure_installed
+  run_compose ps
+}
+
+cmd_logs() {
+  ensure_installed
+  run_compose logs -f
+}
+
+cmd_reload() {
+  ensure_installed
+  run_compose kill -s HUP traefik
+}
+
+cmd_restart() {
+  cmd_down
+  cmd_up
+}
+
+cmd_inspect() {
+  local port
+  port="$(current_dashboard_port || true)"
+  port="${port:-<unassigned>}"
+  cat <<INFO
+State Dir : ${STATE_DIR}
+Compose   : ${STATE_DIR}/docker-compose.yml
+Network   : ${NETWORK_NAME}
+Project   : ${PROJECT_NAME}
+Port Range: ${DASHBOARD_PORT_RANGE}
+Dashboard : ${port}
+INFO
+}
+
+cmd_network() {
+  ensure_network
+  log "shared network: ${NETWORK_NAME}"
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  up) shift; cmd_up "$@" ;;
+  down) shift; cmd_down "$@" ;;
+  restart) shift; cmd_restart "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  reload) shift; cmd_reload "$@" ;;
+  inspect) shift; cmd_inspect "$@" ;;
+  network) shift; cmd_network "$@" ;;
+  help|-h|--help|'') usage ;;
+  *) usage; exit 1 ;;
+esac
