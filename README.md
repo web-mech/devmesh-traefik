@@ -16,8 +16,6 @@ graph LR
     T -->|Host=admin.localhost| C[Project C dashboard:5173]
 ```
 
-Mermaid diagrams validated via `@mermaid-js/mermaid-cli` so you can paste them straight into docs.
-
 ## Install the shared router
 
 ```bash
