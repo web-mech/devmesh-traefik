@@ -1,0 +1,22 @@
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: devmesh-traefik
+    command:
+      - --configfile=/etc/traefik/traefik.yml
+    ports:
+      - "80:80"
+      - "443:443"
+      - "${DMT_DASHBOARD_PORT:-7680}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./config/dynamic:/etc/traefik/dynamic:ro
+      - ./letsencrypt:/etc/traefik/acme
+    networks:
+      - devmesh-traefik
+    restart: unless-stopped
+
+networks:
+  devmesh-traefik:
+    external: true
